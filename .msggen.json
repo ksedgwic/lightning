@@ -8457,7 +8457,7 @@
         },
         "GetRoutes.routes[].path[].amount_msat": {
             "added": "v24.08",
-            "deprecated": null
+            "deprecated": "v26.06"
         },
         "GetRoutes.routes[].path[].amount_out_msat": {
             "added": "v26.06",
@@ -8473,7 +8473,7 @@
         },
         "GetRoutes.routes[].path[].delay": {
             "added": "v24.08",
-            "deprecated": null
+            "deprecated": "v26.06"
         },
         "GetRoutes.routes[].path[].direction": {
             "added": "v24.08",
@@ -8481,7 +8481,7 @@
         },
         "GetRoutes.routes[].path[].next_node_id": {
             "added": "v24.08",
-            "deprecated": null
+            "deprecated": "v26.06"
         },
         "GetRoutes.routes[].path[].node_id_in": {
             "added": "v26.06",
