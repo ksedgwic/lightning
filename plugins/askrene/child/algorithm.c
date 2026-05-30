@@ -41,7 +41,15 @@ bool BFS_path(const tal_t *ctx, const struct graph *graph,
 	while (queue_start < queue_end) {
 		struct node cur = {.idx = queue[queue_start++]};
 
-		if (cur.idx == destination.idx) {
+		/* prev[destination] is INVALID until we reach destination via
+		 * an actual arc.  For non-circular routes (source != destination)
+		 * this is always true on the iteration that pops destination.
+		 * For circular routes (source == destination) this guard prevents
+		 * matching on the very first iteration -- when we pop source --
+		 * and forces BFS to keep searching until it returns to source via
+		 * an arc, which sets prev[source]. */
+		if (cur.idx == destination.idx
+		    && prev[cur.idx].idx != INVALID_INDEX) {
 			target_found = true;
 			break;
 		}
@@ -56,8 +64,13 @@ bool BFS_path(const tal_t *ctx, const struct graph *graph,
 			const struct node next = arc_head(graph, arc);
 
 			/* if that node has been seen previously */
-			if (prev[next.idx].idx != INVALID_INDEX ||
-			    next.idx == source.idx)
+			if (prev[next.idx].idx != INVALID_INDEX)
+				continue;
+			/* don't re-enter source on a non-circular search;
+			 * circular routes (source == destination) need to
+			 * re-enter source to terminate. */
+			if (next.idx == source.idx
+			    && source.idx != destination.idx)
 				continue;
 
 			prev[next.idx] = arc;
@@ -121,7 +134,10 @@ bool dijkstra_path(const tal_t *ctx, const struct graph *graph,
 			continue;
 		bitmap_set_bit(visited, cur);
 
-		if (cur == destination.idx) {
+		/* Same circular-route guard as in BFS_path: only accept
+		 * destination if it was reached via an actual arc. */
+		if (cur == destination.idx
+		    && prev[cur].idx != INVALID_INDEX) {
 			target_found = true;
 			if (prune)
 				break;
@@ -175,8 +191,11 @@ static s64 get_augmenting_flow(const struct graph *graph,
 	int path_length = 0;
 	s64 flow = INFINITE;
 
+	/* do-while so the first iteration always executes -- for
+	 * circular routes (target == source) the path goes through at
+	 * least one arc before returning to source. */
 	struct node cur = target;
-	while (cur.idx != source.idx) {
+	do {
 		assert(cur.idx < max_num_nodes);
 		const struct arc arc = prev[cur.idx];
 		assert(arc.idx < max_num_arcs);
@@ -186,14 +205,15 @@ static s64 get_augmenting_flow(const struct graph *graph,
 		 * hence the next node is at the tail of the arc. */
 		cur = arc_tail(graph, arc);
 
-		/* We may never have a path exceeds the number of nodes, it this
-		 * happens it means we have an infinite loop. */
+		/* A path through N nodes uses at most N arcs (N for a
+		 * cycle, N-1 for a simple path).  Anything strictly greater
+		 * indicates an infinite loop. */
 		path_length++;
-		if(path_length >= max_num_nodes){
+		if (path_length > max_num_nodes) {
 			flow = -1;
 			break;
 		}
-	}
+	} while (cur.idx != source.idx);
 
 	assert(flow < INFINITE && flow > 0);
 	return flow;
@@ -239,7 +259,10 @@ static void augment_flow(const struct graph *graph,
 	/* count the number of arcs in the path */
 	int path_length = 0;
 
-	while (cur.idx != source.idx) {
+	/* do-while so the first iteration always executes -- for
+	 * circular routes (target == source) the path goes through at
+	 * least one arc before returning to source. */
+	do {
 		assert(cur.idx < max_num_nodes);
 		const struct arc arc = prev[cur.idx];
 
@@ -249,13 +272,14 @@ static void augment_flow(const struct graph *graph,
 		 * hence the next node is at the tail of the arc. */
 		cur = arc_tail(graph, arc);
 
-		/* We may never have a path exceeds the number of nodes, it this
-		 * happens it means we have an infinite loop. */
+		/* A path through N nodes uses at most N arcs (N for a
+		 * cycle, N-1 for a simple path).  Anything strictly greater
+		 * indicates an infinite loop. */
 		path_length++;
-		if (path_length >= max_num_nodes)
+		if (path_length > max_num_nodes)
 			break;
-	}
-	assert(path_length < max_num_nodes);
+	} while (cur.idx != source.idx);
+	assert(path_length <= max_num_nodes);
 }
 
 bool simple_feasibleflow(const tal_t *ctx,

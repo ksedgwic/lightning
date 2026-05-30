@@ -725,9 +725,12 @@ static struct flow *substract_flow(const tal_t *ctx,
 	delta = MIN(delta, balance[sink.idx]);
 
 	/* We can only walk backwards, now get me the legth of the path and the
-	 * max flow we can send through this route. */
-	for (u32 cur_idx = sink.idx; cur_idx != source.idx;
-	     cur_idx = prev_idx[cur_idx]) {
+	 * max flow we can send through this route.
+	 *
+	 * do-while so the first iteration always executes -- for circular
+	 * routes (sink == source) the path has at least one arc. */
+	u32 cur_idx = sink.idx;
+	do {
 		assert(cur_idx != INVALID_INDEX);
 		const int dir = prev_dir[cur_idx];
 		const struct gossmap_chan *const chan = prev_chan[cur_idx];
@@ -739,7 +742,8 @@ static struct flow *substract_flow(const tal_t *ctx,
 
 		delta = MIN(delta, chan_flow[chan_idx].half[dir]);
 		length++;
-	}
+		cur_idx = prev_idx[cur_idx];
+	} while (cur_idx != source.idx);
 
 	struct flow *f = tal(ctx, struct flow);
 	f->path = tal_arr(f, const struct gossmap_chan *, length);
@@ -749,8 +753,8 @@ static struct flow *substract_flow(const tal_t *ctx,
 	assert(delta > 0);
 	balance[source.idx] += delta;
 	balance[sink.idx] -= delta;
-	for (u32 cur_idx = sink.idx; cur_idx != source.idx;
-	     cur_idx = prev_idx[cur_idx]) {
+	cur_idx = sink.idx;
+	do {
 		const int dir = prev_dir[cur_idx];
 		const struct gossmap_chan *const chan = prev_chan[cur_idx];
 		const u32 chan_idx = gossmap_chan_idx(gossmap, chan);
@@ -762,7 +766,8 @@ static struct flow *substract_flow(const tal_t *ctx,
 		f->dirs[length] = dir;
 
 		chan_flow[chan_idx].half[dir] -= delta;
-	}
+		cur_idx = prev_idx[cur_idx];
+	} while (cur_idx != source.idx);
 	if (!amount_msat_mul(&f->delivers, params->accuracy, delta))
 		abort();
 	return f;
@@ -906,17 +911,21 @@ get_flow_singlepath(const tal_t *ctx, const struct pay_parameters *params,
 
 	size_t length = 0;
 
-	for (u32 cur_idx = destination.idx; cur_idx != source.idx;) {
+	/* do-while so the first iteration always executes -- for circular
+	 * routes (destination == source) the path has at least one arc. */
+	u32 cur_idx = destination.idx;
+	do {
 		assert(cur_idx != INVALID_INDEX);
 		length++;
 		struct arc arc = prev[cur_idx];
 		struct node next = arc_tail(graph, arc);
 		cur_idx = next.idx;
-	}
+	} while (cur_idx != source.idx);
 	f->path = tal_arr(f, const struct gossmap_chan *, length);
 	f->dirs = tal_arr(f, int, length);
 
-	for (u32 cur_idx = destination.idx; cur_idx != source.idx;) {
+	cur_idx = destination.idx;
+	do {
 		int chandir;
 		u32 chanidx;
 		struct arc arc = prev[cur_idx];
@@ -928,7 +937,7 @@ get_flow_singlepath(const tal_t *ctx, const struct pay_parameters *params,
 
 		struct node next = arc_tail(graph, arc);
 		cur_idx = next.idx;
-	}
+	} while (cur_idx != source.idx);
 	f->delivers = params->amount;
 	return flows;
 }

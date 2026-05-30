@@ -92,6 +92,62 @@ int main(int argc, char *argv[])
 	printf("node(%" PRIu32 ") arc(NONE)\n", src.idx);
 	printf("path length: %d\n", pathlen);
 
+	/* ---------- circular BFS (src == dst) ---------- *
+	 *
+	 * Build a fresh triangle graph:
+	 *     10:   11 -> 12
+	 *     11:   12 -> 13
+	 *     12:   13 -> 11
+	 *
+	 * Run BFS with src == dst == 11.  The only viable closed walk is
+	 * 11 -> 12 -> 13 -> 11.  Pre-patch, BFS returned a zero-length
+	 * "path" because cur.idx == destination.idx matched on the very
+	 * first iteration with prev[cur] still INVALID.  Post-patch the
+	 * destination check requires prev[cur] != INVALID, so BFS keeps
+	 * searching until an arc terminates at source and prev[source]
+	 * gets set.
+	 */
+	printf("\nCircular BFS test (src == dst)\n");
+
+	struct graph *cgraph = graph_new(ctx, MAX_NODES, MAX_ARCS, DUAL_BIT);
+	assert(cgraph);
+	s64 *ccap = tal_arrz(ctx, s64, MAX_ARCS);
+	struct arc *cprev = tal_arr(ctx, struct arc, MAX_NODES);
+
+	graph_add_arc(cgraph, arc_obj(10), node_obj(11), node_obj(12));
+	ccap[10] = 1;
+	graph_add_arc(cgraph, arc_obj(11), node_obj(12), node_obj(13));
+	ccap[11] = 1;
+	graph_add_arc(cgraph, arc_obj(12), node_obj(13), node_obj(11));
+	ccap[12] = 1;
+
+	struct node csrc = {.idx = 11};
+	struct node cdst = {.idx = 11};
+
+	bool cresult = BFS_path(ctx, cgraph, csrc, cdst, ccap, 1, cprev);
+	CHECK(cresult);
+
+	/* Walk the cycle backwards from destination.  do-while form
+	 * because src == dst -- the first iteration must execute. */
+	int carc_sequence[] = {12, 11, 10};
+	int cnode_sequence[] = {13, 12, 11};
+	int cpathlen = 0;
+	printf("circular path: ");
+	struct node cur_node = cdst;
+	do {
+		struct arc carc = cprev[cur_node.idx];
+		printf("node(%" PRIu32 ") arc(%" PRIu32 ") - ",
+		       cur_node.idx, carc.idx);
+		cur_node = arc_tail(cgraph, carc);
+		CHECK(cpathlen < 3);
+		CHECK(cur_node.idx == cnode_sequence[cpathlen]);
+		CHECK(carc.idx == carc_sequence[cpathlen]);
+		cpathlen++;
+	} while (cur_node.idx != csrc.idx);
+	CHECK(cpathlen == 3);
+	printf("node(%" PRIu32 ") arc(START)\n", csrc.idx);
+	printf("circular path length: %d\n", cpathlen);
+
 	printf("Freeing memory\n");
 	ctx = tal_free(ctx);
 
