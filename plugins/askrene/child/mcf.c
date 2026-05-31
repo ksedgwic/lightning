@@ -301,6 +301,19 @@ struct pay_parameters {
 
 	double delay_feefactor;
 	double base_fee_penalty;
+
+	/* Circular routing (self-rebalance): source == target.
+	 *
+	 * We model this as a regular s-t flow problem by splitting the
+	 * source node into two virtual graph nodes: the real source
+	 * keeps its outgoing arcs, and a synthetic "us_in" node owns
+	 * the incoming arcs.  The MCF/Dijkstra/BFS then run unchanged
+	 * with src = source.idx, dst = us_in_idx.
+	 *
+	 * us_in_idx is INVALID_INDEX in non-circular mode.
+	 */
+	bool circular;
+	u32 us_in_idx;
 };
 
 /* Helper function.
@@ -536,7 +549,12 @@ static void init_linear_network(const tal_t *ctx,
 	const struct gossmap *gossmap = params->rq->gossmap;
 	const size_t max_num_chans = gossmap_max_chan_idx(gossmap);
 	const size_t max_num_arcs = max_num_chans * ARCS_PER_CHANNEL;
-	const size_t max_num_nodes = gossmap_max_node_idx(gossmap);
+	/* For circular routes we add one virtual "us_in" node that
+	 * inherits the incoming arcs of source.  See pay_parameters
+	 * doc for the rationale. */
+	const size_t max_num_nodes =
+	    gossmap_max_node_idx(gossmap) + (params->circular ? 1 : 0);
+	const u32 source_idx = gossmap_node_idx(gossmap, params->source);
 
 	*graph = graph_new(ctx, max_num_nodes, max_num_arcs, ARC_DUAL_BITOFF);
 	*arc_prob_cost = tal_arr(ctx, double, max_num_arcs);
@@ -578,6 +596,14 @@ static void init_linear_network(const tal_t *ctx,
 			if(node_id==next_id)
 				continue;
 
+			/* Node-splitting for circular routes: arcs whose
+			 * head was the real source are redirected to land
+			 * on us_in instead.  Outgoing arcs from source are
+			 * untouched.  See pay_parameters doc. */
+			const u32 head_id =
+			    (params->circular && next_id == source_idx)
+				? params->us_in_idx : next_id;
+
 			// `cost` is the word normally used to denote cost per
 			// unit of flow in the context of MCF.
 			double prob_cost[CHANNEL_PARTS];
@@ -608,7 +634,7 @@ static void init_linear_network(const tal_t *ctx,
 
 				graph_add_arc(*graph, arc,
 					      node_obj(node_id),
-					      node_obj(next_id));
+					      node_obj(head_id));
 
 				(*arc_capacity)[arc.idx] = capacity[k];
 				(*arc_prob_cost)[arc.idx] = prob_cost[k];
@@ -963,6 +989,12 @@ static struct flow **minflow(const tal_t *ctx,
 	params->source = source;
 	params->target = target;
 	params->amount = amount;
+	/* Circular routing (source == target): split source via a
+	 * virtual us_in node, see pay_parameters doc. */
+	params->circular = (source == target);
+	params->us_in_idx = params->circular
+	    ? gossmap_max_node_idx(rq->gossmap)
+	    : INVALID_INDEX;
 	/* -> We reduce the granularity of the flow by limiting the subdivision
 	 * of the payment amount into 1000 units of flow. That reduces the
 	 * computational burden for algorithms that depend on it, eg. "capacity
@@ -1004,7 +1036,11 @@ static struct flow **minflow(const tal_t *ctx,
 	node_potential = tal_arrz(working_ctx, s64, max_num_nodes);
 	node_excess = tal_arrz(working_ctx, s64, max_num_nodes);
 
-	const struct node dst = {.idx = gossmap_node_idx(rq->gossmap, target)};
+	const struct node dst = {
+	    .idx = params->circular
+		? params->us_in_idx
+		: gossmap_node_idx(rq->gossmap, target)
+	};
 	const struct node src = {.idx = gossmap_node_idx(rq->gossmap, source)};
 
 
@@ -1061,7 +1097,12 @@ static void init_linear_network_single_path(
 {
 	const size_t max_num_chans = gossmap_max_chan_idx(params->rq->gossmap);
 	const size_t max_num_arcs = max_num_chans * ARCS_PER_CHANNEL;
-	const size_t max_num_nodes = gossmap_max_node_idx(params->rq->gossmap);
+	/* For circular routes we add one virtual "us_in" node. */
+	const size_t max_num_nodes =
+	    gossmap_max_node_idx(params->rq->gossmap)
+	    + (params->circular ? 1 : 0);
+	const u32 source_idx =
+	    gossmap_node_idx(params->rq->gossmap, params->source);
 
 	*graph = graph_new(ctx, max_num_nodes, max_num_arcs, ARC_DUAL_BITOFF);
 	*arc_prob_cost = tal_arr(ctx, double, max_num_arcs);
@@ -1121,11 +1162,17 @@ static void init_linear_network_single_path(
 			if (node_id == next_id)
 				continue;
 
+			/* Node-splitting for circular routes: redirect
+			 * arcs landing on source to land on us_in. */
+			const u32 head_id =
+			    (params->circular && next_id == source_idx)
+				? params->us_in_idx : next_id;
+
 			struct arc arc =
 			    arc_from_parts(chan_id, half, 0, false);
 
 			graph_add_arc(*graph, arc, node_obj(node_id),
-				      node_obj(next_id));
+				      node_obj(head_id));
 
 			(*arc_capacity)[arc.idx] = 1;
 			(*arc_prob_cost)[arc.idx] =
@@ -1181,6 +1228,13 @@ static struct flow **single_path_flow(const tal_t *ctx, const struct route_query
 	params->accuracy = amount;
 	params->delay_feefactor = delay_feefactor;
 	params->base_fee_penalty = base_fee_penalty_estimate(amount);
+	/* Circular routing: source == target.  Add a virtual us_in
+	 * node so the algorithm sees a regular s-t flow problem.  See
+	 * pay_parameters doc. */
+	params->circular = (source == target);
+	params->us_in_idx = params->circular
+	    ? gossmap_max_node_idx(rq->gossmap)
+	    : INVALID_INDEX;
 
 	struct graph *graph;
 	double *arc_prob_cost;
@@ -1191,7 +1245,11 @@ static struct flow **single_path_flow(const tal_t *ctx, const struct route_query
 					&arc_prob_cost, &arc_fee_cost,
 					&arc_capacity);
 
-	const struct node dst = {.idx = gossmap_node_idx(rq->gossmap, target)};
+	const struct node dst = {
+	    .idx = params->circular
+		? params->us_in_idx
+		: gossmap_node_idx(rq->gossmap, target)
+	};
 	const struct node src = {.idx = gossmap_node_idx(rq->gossmap, source)};
 
 	const size_t max_num_nodes = graph_max_num_nodes(graph);
