@@ -221,6 +221,7 @@ void run_child(const struct gossmap *gossmap,
 	       struct amount_msat amount, struct amount_msat maxfee,
 	       u32 finalcltv, u32 maxdelay, size_t maxparts,
               bool include_fees,
+	       bool circular,
 	       const char *cmd_id,
 	       struct json_filter *cmd_filter,
 	       bool include_next_node_id,
@@ -264,6 +265,18 @@ void run_child(const struct gossmap *gossmap,
 	/* convert flows to routes */
 	routes = convert_flows_to_routes(rq, rq, finalcltv, flows, include_fees);
 	assert(tal_count(routes) == tal_count(flows));
+
+	/* Circular mode: the parent spliced a fake destination node into
+	 * gossmap so MCF could see a regular s -> t flow.  The last hop
+	 * of every returned route is the fake source -> fake_node edge;
+	 * strip it so the caller sees a clean cycle ending at source. */
+	if (circular) {
+		for (size_t i = 0; i < tal_count(routes); i++) {
+			const size_t n = tal_count(routes[i]->hops);
+			assert(n >= 1);
+			tal_resize(&routes[i]->hops, n - 1);
+		}
+	}
 
 	/* output the results */
 	struct json_stream *js = new_json_stream(tmpctx, NULL, NULL);

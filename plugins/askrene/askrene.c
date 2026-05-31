@@ -359,7 +359,103 @@ struct getroutes_info {
 	/* Non-NULL if we are told to use "auto.localchans" */
 	struct layer *local_layer;
 	u32 maxparts;
+	/* Circular routing (self-rebalance) support.
+	 *
+	 * When the caller passes source == destination we synthesise a
+	 * fake "drain" node and a fake channel from source -> fake_node
+	 * into this request's localmods.  The MCF sees a normal s -> t
+	 * flow problem (source -> ... -> source -> fake_node), and the
+	 * algorithm + flow-extraction code runs unchanged.  The trailing
+	 * fake hop is stripped from the returned route in run_child.
+	 *
+	 * `circular` is set by inject_circular_fake().
+	 * `dest` is replaced with the fake node id so the destination
+	 * lookup at do_getroutes finds the fake node; the original
+	 * destination (which equals source) is not preserved separately
+	 * because it equals source by construction. */
+	bool circular;
 };
+
+/* Hardcoded fake-node id used for circular routing.  Must not
+ * collide with any real Lightning node id likely to appear in
+ * gossmap.  Starts with 0x02 (a valid compressed pubkey prefix)
+ * followed by zero bytes and 0xff terminator -- distinct from
+ * renepay's fake destination (which uses ...0001).  Lives only in
+ * the per-request localmods so any collision is bounded to one
+ * request. */
+static const struct node_id circular_fake_node_id = {{
+	0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xff,
+}};
+
+/* Hardcoded fake scid (block 0, tx 0, output 0) for the fake
+ * source -> fake_node channel.  Block 0 is the genesis block which
+ * has no real channels, so this cannot collide with any real
+ * scid. */
+static struct short_channel_id circular_fake_scid(void)
+{
+	struct short_channel_id scid;
+	if (!mk_short_channel_id(&scid, 0, 0, 0))
+		abort();
+	return scid;
+}
+
+/* If source == destination (a self-rebalance call), splice a fake
+ * destination node into this request's localmods so that downstream
+ * algorithms see a regular s -> t flow problem.  Returns true on
+ * activation, false for normal (non-circular) requests.
+ *
+ * Must be called before gossmap_apply_localmods() so the fake node
+ * is visible to the source/destination lookup later in
+ * do_getroutes. */
+static bool inject_circular_fake(struct getroutes_info *info,
+				 struct gossmap_localmods *localmods)
+{
+	if (!node_id_eq(&info->source, &info->dest))
+		return false;
+
+	const struct short_channel_id scid = circular_fake_scid();
+	const struct short_channel_id_dir scidd_out = {
+		.scid = scid,
+		.dir = node_id_cmp(&info->source,
+				   &circular_fake_node_id) < 0 ? 0 : 1,
+	};
+
+	/* Capacity large enough to carry any amount this request might
+	 * push through.  Use the requested amount plus headroom so MCF
+	 * never declines the fake channel for capacity reasons. */
+	struct amount_msat capacity = info->amount;
+	if (!amount_msat_accumulate(&capacity, info->maxfee))
+		abort();
+	if (!amount_msat_accumulate(&capacity, AMOUNT_MSAT(1000000)))
+		abort();
+
+	if (!gossmap_local_addchan(localmods,
+				   &info->source, &circular_fake_node_id,
+				   scid, capacity, NULL))
+		abort();
+
+	/* Enable the outgoing direction (source -> fake_node) with zero
+	 * fees, generous htlc bounds, and zero cltv delta so MCF treats
+	 * it as a free drain edge. */
+	const bool enabled = true;
+	const struct amount_msat htlc_min = AMOUNT_MSAT(0);
+	const struct amount_msat htlc_max = capacity;
+	const struct amount_msat fee_base = AMOUNT_MSAT(0);
+	const u32 fee_ppm = 0;
+	const u16 cltv_delta = 0;
+	gossmap_local_updatechan(localmods, &scidd_out,
+				 &enabled,
+				 &htlc_min, &htlc_max,
+				 &fee_base, &fee_ppm, &cltv_delta);
+
+	info->dest = circular_fake_node_id;
+	info->circular = true;
+	return true;
+}
 
 static void add_layer(const struct layer ***layers,
 		      const struct layer *l,
@@ -616,6 +712,15 @@ static struct command_result *do_getroutes(struct command *cmd,
 	reserves_clear_capacities(askrene->reserved, askrene->gossmap,
 				  capacities);
 
+	/* Self-rebalance handling: when source == destination, inject a
+	 * fake destination node so the MCF sees a regular s -> t flow.
+	 * Must precede gossmap_apply_localmods so the fake node is
+	 * visible to the destination lookup below. */
+	if (inject_circular_fake(info, localmods)) {
+		cmd_log(tmpctx, cmd, LOG_DBG,
+			"Circular routing: spliced fake destination node");
+	}
+
 	/* we temporarily apply localmods */
 	gossmap_apply_localmods(askrene->gossmap, localmods);
 
@@ -718,6 +823,7 @@ static struct command_result *do_getroutes(struct command *cmd,
 			  deadline, srcnode, dstnode, info->amount,
 			  info->maxfee, info->finalcltv, info->maxdelay, info->maxparts,
 			  include_fees,
+			  info->circular,
 			  cmd->id, cmd->filter,
 			  include_next_node_id,
 			  include_amount_msat,

@@ -15,7 +15,12 @@ struct json_filter;
 struct layer;
 struct reserve_htable;
 
-/* This is the child.  Do the thing. */
+/* This is the child.  Do the thing.
+ *
+ * `circular` indicates source == destination on the caller's side and
+ * a fake destination node has been spliced into the gossmap via
+ * localmods.  After flow extraction the trailing fake hop is stripped
+ * from each returned route so callers see a clean cycle. */
 void run_child(const struct gossmap *gossmap,
 	       const struct layer **layers,
 	       const s8 *biases,
@@ -29,6 +34,7 @@ void run_child(const struct gossmap *gossmap,
 	       struct amount_msat amount, struct amount_msat maxfee,
 	       u32 finalcltv, u32 maxdelay, size_t maxparts,
 	       bool include_fees,
+	       bool circular,
 	       const char *cmd_id,
 	       struct json_filter *cmd_filter,
 	       bool include_next_node_id,
