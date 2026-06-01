@@ -206,6 +206,7 @@ void run_child(const struct gossmap *gossmap,
 	       struct amount_msat amount, struct amount_msat maxfee,
 	       u32 finalcltv, u32 maxdelay, size_t maxparts,
               bool include_fees,
+	       bool circular,
 	       const char *cmd_id,
 	       struct json_filter *cmd_filter,
 	       int replyfd)
@@ -247,6 +248,25 @@ void run_child(const struct gossmap *gossmap,
 					 &amounts, include_fees);
 	assert(tal_count(routes) == tal_count(flows));
 	assert(tal_count(amounts) == tal_count(flows));
+
+	/* Circular mode: the parent spliced a fake destination node
+	 * (and mirror channels onto it) into gossmap localmods so the
+	 * MCF could see a regular s -> t flow.  Every returned route
+	 * therefore ends with a (peer -> fake_us_in) hop.  We KEEP
+	 * that hop in the response: its amount_out_msat is the
+	 * actually-delivered amount (post fill-peer fee), and its
+	 * scid + node_id_out are sentinel placeholders the caller
+	 * recognises and replaces with their chosen real closing
+	 * channel + their own node id when building sendpay.
+	 *
+	 * Why keep instead of strip: stripping the last hop forced
+	 * route.amount_msat to report the PRE-fee amount (= what
+	 * fill_peer received).  Callers that used route.amount_msat
+	 * as the closing-hop amount paid 0 fee to the forwarder and
+	 * got back WIRE_FEE_INSUFFICIENT on every retry.  Keeping
+	 * the fake hop preserves the standard askrene contract:
+	 * route.amount_msat is the amount delivered at the route's
+	 * destination, same as for non-circular routes. */
 
 	/* output the results */
 	struct json_stream *js = new_json_stream(tmpctx, NULL, NULL);

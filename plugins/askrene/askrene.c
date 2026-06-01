@@ -353,7 +353,179 @@ struct getroutes_info {
 	/* Non-NULL if we are told to use "auto.localchans" */
 	struct layer *local_layer;
 	u32 maxparts;
+	/* Circular routing (self-rebalance) support.
+	 *
+	 * When the caller passes source == destination, we splice a
+	 * node-split into this request's per-request localmods:
+	 *   - Synthesise a fake "us_in" destination node.
+	 *   - For every (peer -> source) direction still enabled
+	 *     after the caller's layers have been applied, disable
+	 *     that real direction and add a mirror (peer -> us_in)
+	 *     channel with matching properties.
+	 *
+	 * The MCF then sees a regular s -> t flow problem with
+	 * source -> ... -> peer -> us_in.  No direct edge connects
+	 * source to us_in, so the algorithm has to traverse the
+	 * network.  Algorithms, flow extraction, and routing-cost
+	 * code run unchanged.
+	 *
+	 * After flow conversion we drop the trailing (peer -> us_in)
+	 * hop in run_child so the caller sees an open-cycle route
+	 * ending at peer; the caller appends the closing (peer ->
+	 * source) hop themselves using the channel they intend.
+	 *
+	 * `circular` is set by inject_circular_fake().
+	 * Existing callers (source != destination) bypass all of
+	 * this -- inject_circular_fake() returns false at its first
+	 * line and never touches localmods or info. */
+	bool circular;
 };
+
+/* Hardcoded fake "us_in" node id for circular routing.  Must not
+ * collide with any real Lightning node id likely to appear in
+ * gossmap.  Lives only in the per-request localmods; collision
+ * within a single request would be a real-world fluke.  Distinct
+ * from renepay's fake destination (which ends in 0x01). */
+static const struct node_id circular_fake_us_in_id = {{
+	0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xff,
+}};
+
+/* Snapshot of a real (peer -> source) channel we want to mirror.
+ * Collected while the user's layers are applied to the gossmap, so
+ * we see the post-mask view and only mirror what the caller has
+ * left enabled. */
+struct circular_mirror {
+	/* The real (peer -> source) channel direction, to disable. */
+	struct short_channel_id_dir real_scidd;
+	/* Peer at the far end of the real channel. */
+	struct node_id peer_id;
+	/* Channel properties to copy onto the fake mirror. */
+	struct amount_msat capacity;
+	struct amount_msat htlc_min, htlc_max;
+	struct amount_msat base_fee;
+	u32 fee_proportional_millionths;
+	u16 cltv_delta;
+};
+
+/* If source == destination (a self-rebalance call), perform
+ * node-splitting at the gossmap layer:
+ *
+ *   1. Apply the caller's layers to the gossmap temporarily so we
+ *      see the post-mask view (i.e. which peer -> source channels
+ *      the caller has left enabled).
+ *   2. For each still-enabled (peer -> source) direction:
+ *        - Disable the real direction in localmods.
+ *        - Add a mirror (peer -> circular_fake_us_in_id) channel
+ *          with a unique fake scid and the real channel's
+ *          properties copied over.
+ *   3. Undo the temporary apply, leaving the augmented localmods
+ *      ready for the regular gossmap_apply_localmods() at the end
+ *      of do_getroutes.
+ *   4. Replace info->dest with circular_fake_us_in_id.
+ *
+ * Returns true when activated, false for non-circular requests --
+ * in which case nothing is touched and the function exits at its
+ * first line. */
+static bool inject_circular_fake(struct getroutes_info *info,
+				 struct gossmap *gossmap,
+				 struct gossmap_localmods *localmods)
+{
+	if (!node_id_eq(&info->source, &info->dest))
+		return false;
+
+	/* Temporary apply so we can read the user's post-mask view. */
+	gossmap_apply_localmods(gossmap, localmods);
+
+	const struct gossmap_node *me =
+	    gossmap_find_node(gossmap, &info->source);
+
+	struct circular_mirror *mirrors =
+	    tal_arr(tmpctx, struct circular_mirror, 0);
+
+	if (me) {
+		for (size_t i = 0; i < me->num_chans; i++) {
+			int us_half;
+			const struct gossmap_chan *c =
+			    gossmap_nth_chan(gossmap, me, i, &us_half);
+			const int peer_to_us_dir = !us_half;
+
+			/* Skip directions the caller has masked off. */
+			if (!c->half[peer_to_us_dir].enabled)
+				continue;
+
+			struct circular_mirror m;
+			m.real_scidd.scid = gossmap_chan_scid(gossmap, c);
+			m.real_scidd.dir = peer_to_us_dir;
+
+			/* gossmap_nth_node(c, dir) returns the SENDER of
+			 * direction dir.  We want the peer at the far end
+			 * of the channel -- i.e. the sender of the
+			 * (peer -> us) direction.  Using us_half here
+			 * would return us, not the peer. */
+			const struct gossmap_node *peer =
+			    gossmap_nth_node(gossmap, c, peer_to_us_dir);
+			gossmap_node_get_id(gossmap, peer, &m.peer_id);
+
+			m.capacity = gossmap_chan_get_capacity(gossmap, c);
+			m.htlc_min =
+			    gossmap_chan_htlc_min(c, peer_to_us_dir);
+			m.htlc_max =
+			    gossmap_chan_htlc_max(c, peer_to_us_dir);
+			m.base_fee =
+			    amount_msat(c->half[peer_to_us_dir].base_fee);
+			m.fee_proportional_millionths =
+			    c->half[peer_to_us_dir].proportional_fee;
+			m.cltv_delta = c->half[peer_to_us_dir].delay;
+
+			tal_arr_expand(&mirrors, m);
+		}
+	}
+
+	/* Undo the temporary apply -- the next apply at do_getroutes
+	 * line ~620 will reapply with our augmentations included. */
+	gossmap_remove_localmods(gossmap, localmods);
+
+	/* Add disable + mirror entries to localmods. */
+	for (size_t i = 0; i < tal_count(mirrors); i++) {
+		const struct circular_mirror *m = &mirrors[i];
+
+		const bool disabled = false;
+		gossmap_local_updatechan(localmods, &m->real_scidd,
+					 &disabled,
+					 NULL, NULL, NULL, NULL, NULL);
+
+		struct short_channel_id fake_scid;
+		if (!mk_short_channel_id(&fake_scid, 0, (u32)i, 0))
+			abort();
+
+		if (!gossmap_local_addchan(localmods, &m->peer_id,
+					   &circular_fake_us_in_id,
+					   fake_scid, m->capacity, NULL))
+			abort();
+
+		const struct short_channel_id_dir mirror_scidd = {
+			.scid = fake_scid,
+			.dir = node_id_cmp(&m->peer_id,
+					   &circular_fake_us_in_id) < 0
+				? 0 : 1,
+		};
+		const bool enabled = true;
+		gossmap_local_updatechan(localmods, &mirror_scidd,
+					 &enabled,
+					 &m->htlc_min, &m->htlc_max,
+					 &m->base_fee,
+					 &m->fee_proportional_millionths,
+					 &m->cltv_delta);
+	}
+
+	info->dest = circular_fake_us_in_id;
+	info->circular = true;
+	return true;
+}
 
 /* Gather layers, clear capacities where layers contains info */
 static const struct layer **apply_layers(const tal_t *ctx,
@@ -574,6 +746,18 @@ static struct command_result *do_getroutes(struct command *cmd,
 	reserves_clear_capacities(askrene->reserved, askrene->gossmap,
 				  capacities);
 
+	/* Self-rebalance handling: when source == destination, splice
+	 * a fake "us_in" destination node into localmods and mirror
+	 * the still-enabled (peer -> source) directions onto it.
+	 * Algorithms see a regular s -> t flow problem and run
+	 * unchanged.  Must precede gossmap_apply_localmods so the
+	 * augmented mods are picked up by the apply below. */
+	if (inject_circular_fake(info, askrene->gossmap, localmods)) {
+		cmd_log(tmpctx, cmd, LOG_DBG,
+			"Circular routing: spliced fake us_in destination "
+			"node, mirrored peer -> source channels into it");
+	}
+
 	/* we temporarily apply localmods */
 	gossmap_apply_localmods(askrene->gossmap, localmods);
 
@@ -671,6 +855,7 @@ static struct command_result *do_getroutes(struct command *cmd,
 			  deadline, srcnode, dstnode, info->amount,
 			  info->maxfee, info->finalcltv, info->maxdelay, info->maxparts,
 			  include_fees,
+			  info->circular,
 			  cmd->id, cmd->filter, replyfds[1]);
 		abort();
 	}
@@ -905,6 +1090,9 @@ static struct command_result *json_getroutes(struct command *cmd,
 	info->dev_algo = *dev_algo;
 	info->additional_costs = new_htable(info, additional_cost_htable);
 	info->maxparts = *maxparts;
+	/* Default circular off; inject_circular_fake() flips this on
+	 * for source == destination requests. */
+	info->circular = false;
 
 	if (askrene->num_live_requests >= askrene->max_children) {
 		cmd_log(tmpctx, cmd, LOG_INFORM,
