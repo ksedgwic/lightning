@@ -2138,6 +2138,7 @@
             "GetRoute.route[].style": 6
         },
         "GetroutesRequest": {
+            "GetRoutes.allow_circular": 10,
             "GetRoutes.amount_msat": 3,
             "GetRoutes.destination": 2,
             "GetRoutes.final_cltv": 7,
@@ -8413,6 +8414,10 @@
         },
         "GetRoutes": {
             "added": "v24.08",
+            "deprecated": null
+        },
+        "GetRoutes.allow_circular": {
+            "added": "v26.09",
             "deprecated": null
         },
         "GetRoutes.amount_msat": {

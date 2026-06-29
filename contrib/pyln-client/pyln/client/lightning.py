@@ -896,6 +896,26 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("getroute", payload)
 
+    def getroutes(self, source, destination, amount_msat, layers, maxfee_msat,
+                  final_cltv, maxdelay=None, maxparts=None, allow_circular=None):
+        """Find routes from {source} to {destination} for {amount_msat},
+        applying {layers}, paying no more than {maxfee_msat},
+        ending in {final_cltv}.  If {allow_circular} is set, permit
+        {source} == {destination} and return a self-rebalance cycle.
+        """
+        payload = {
+            "source": source,
+            "destination": destination,
+            "amount_msat": amount_msat,
+            "layers": layers,
+            "maxfee_msat": maxfee_msat,
+            "final_cltv": final_cltv,
+            "maxdelay": maxdelay,
+            "maxparts": maxparts,
+            "allow_circular": allow_circular,
+        }
+        return self.call("getroutes", payload)
+
     def help(self, command=None):
         """
         Show available commands, or just {command} if supplied.
