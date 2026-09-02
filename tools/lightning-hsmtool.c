@@ -8,6 +8,7 @@
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
+#include <bitcoin/script.h>
 #include <common/bech32.h>
 #include <common/bech32_util.h>
 #include <common/codex32.h>
@@ -53,6 +54,8 @@ static void show_usage(const char *progname)
 	printf("	- generatehsm <path/to/new/hsm_secret>\n");
 	printf("	- derivetoremote <node id> <channel dbid> [<cmt pt>] "
 	       "<path/to/hsm_secret>\n");
+	printf("	- derivedelayed <node id> <channel dbid> <commitment number> "
+	       "<to_self_delay> <peer revocation basepoint> <path/to/hsm_secret>\n");
 	printf("	- checkhsm <path/to/new/hsm_secret>\n");
 	printf("	- dumponchaindescriptors [--show-secrets] <path/to/hsm_secret> [network]\n");
 	printf("	- makerune <path/to/hsm_secret>\n");
@@ -477,6 +480,68 @@ static void derive_to_remote(const struct unilateral_close_info *info, const cha
 	printf("privkey : %s\n", fmt_secret(tmpctx, &privkey.secret));
 }
 
+/* The keys and script of our own to_local output in one of our
+ * commitment transactions, for a sweep by hand (the case: lightningd
+ * closed on a splice inflight and onchaind did not recognise the
+ * commitment as ours).  Everything comes from hsm_secret plus the peer
+ * id and channel dbid, except the peer's revocation basepoint, which
+ * the channel_reestablish/DB holds. */
+static void derive_delayed(const struct node_id *node_id, u64 channel_id,
+			   u64 commit_num, u16 to_self_delay,
+			   const struct pubkey *peer_revocation_basepoint,
+			   const char *hsm_secret_path)
+{
+	struct secret hsm_secret, channel_seed, basepoint_secret;
+	struct pubkey funding_pubkey, basepoint, per_commitment_point;
+	struct pubkey delayed_key, revocation_key;
+	struct privkey privkey;
+	struct sha256 shaseed;
+	u8 *wscript, *scriptpubkey;
+
+	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
+						 | SECP256K1_CONTEXT_SIGN);
+
+	struct hsm_secret *hsms = load_hsm_secret(tmpctx, hsm_secret_path);
+	memcpy(hsm_secret.data, hsms->secret_data, sizeof(hsm_secret.data));
+	get_channel_seed(&channel_seed, node_id, channel_id, &hsm_secret);
+
+	/* The funding key is the check: it must be one of the two keys in
+	 * the commitment's witness script, or the seed is wrong. */
+	if (!derive_funding_key(&channel_seed, &funding_pubkey, NULL))
+		errx(ERROR_KEYDERIV, "Could not derive funding key for dbid %"PRIu64,
+		     channel_id);
+	if (!derive_shaseed(&channel_seed, &shaseed))
+		errx(ERROR_KEYDERIV, "Could not derive shaseed for dbid %"PRIu64,
+		     channel_id);
+	if (!per_commit_point(&shaseed, &per_commitment_point, commit_num))
+		errx(ERROR_KEYDERIV, "Could not derive per-commitment point #%"PRIu64,
+		     commit_num);
+	if (!derive_delayed_payment_basepoint(&channel_seed, &basepoint,
+					      &basepoint_secret))
+		errx(ERROR_KEYDERIV, "Could not derive delayed payment basepoint"
+		     " for dbid %"PRIu64, channel_id);
+	if (!derive_simple_key(&basepoint, &per_commitment_point, &delayed_key))
+		errx(ERROR_KEYDERIV, "Could not derive delayed payment key");
+	if (!derive_simple_privkey(&basepoint_secret, &basepoint,
+				   &per_commitment_point, &privkey))
+		errx(ERROR_KEYDERIV, "Could not derive delayed payment privkey");
+	if (!derive_revocation_key(peer_revocation_basepoint,
+				   &per_commitment_point, &revocation_key))
+		errx(ERROR_KEYDERIV, "Could not derive revocation key");
+
+	wscript = bitcoin_wscript_to_local(tmpctx, to_self_delay, 0,
+					   &revocation_key, &delayed_key);
+	scriptpubkey = scriptpubkey_p2wsh(tmpctx, wscript);
+
+	printf("funding pubkey       : %s\n", fmt_pubkey(tmpctx, &funding_pubkey));
+	printf("per-commitment point : %s\n", fmt_pubkey(tmpctx, &per_commitment_point));
+	printf("delayed pubkey       : %s\n", fmt_pubkey(tmpctx, &delayed_key));
+	printf("delayed privkey      : %s\n", fmt_secret(tmpctx, &privkey.secret));
+	printf("revocation pubkey    : %s\n", fmt_pubkey(tmpctx, &revocation_key));
+	printf("witness script       : %s\n", tal_hex(tmpctx, wscript));
+	printf("scriptpubkey (p2wsh) : %s\n", tal_hex(tmpctx, scriptpubkey));
+}
+
 static void dumponchaindescriptors(const char *hsm_secret_path,
 				   const u32 version, bool show_secrets)
 {
@@ -721,6 +786,21 @@ int main(int argc, char *argv[])
 			info.commitment_point = &commitment_point;
 		}
 		derive_to_remote(&info, argv[argc - 1]);
+
+	} else if (streq(method, "derivedelayed")) {
+		/*  node_id  channel_dbid  commit_num  to_self_delay  peer_revocation_basepoint  hsm_secret */
+		if (argc != 8)
+			show_usage(argv[0]);
+		struct node_id node_id;
+		struct pubkey peer_revocation_basepoint;
+		if (!node_id_from_hexstr(argv[2], strlen(argv[2]), &node_id))
+			errx(ERROR_USAGE, "Bad node id");
+		if (!pubkey_from_hexstr(argv[6], strlen(argv[6]),
+					&peer_revocation_basepoint))
+			errx(ERROR_USAGE, "Bad peer revocation basepoint");
+		derive_delayed(&node_id, atol(argv[3]), atol(argv[4]),
+			       atol(argv[5]), &peer_revocation_basepoint,
+			       argv[7]);
 
 	} else if (streq(method, "generatehsm")) {
 		if (argc != 3)
