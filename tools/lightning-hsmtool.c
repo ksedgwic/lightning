@@ -8,7 +8,11 @@
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
+#include <bitcoin/chainparams.h>
 #include <bitcoin/script.h>
+#include <bitcoin/signature.h>
+#include <bitcoin/tx.h>
+#include <common/addr.h>
 #include <common/bech32.h>
 #include <common/bech32_util.h>
 #include <common/codex32.h>
@@ -18,6 +22,7 @@
 #include <common/hsm_secret.h>
 #include <common/key_derive.h>
 #include <common/memleak.h>
+#include <common/setup.h>
 #include <common/utils.h>
 #include <common/utxo.h>
 #include <errno.h>
@@ -56,6 +61,10 @@ static void show_usage(const char *progname)
 	       "<path/to/hsm_secret>\n");
 	printf("	- derivedelayed <node id> <channel dbid> <commitment number> "
 	       "<to_self_delay> <peer revocation basepoint> <path/to/hsm_secret>\n");
+	printf("	- sweepdelayed <node id> <channel dbid> <commitment number> "
+	       "<to_self_delay> <peer revocation basepoint> <txid> <vout> "
+	       "<amount sat> <destination address> <fee sat> "
+	       "<path/to/hsm_secret> [network]\n");
 	printf("	- checkhsm <path/to/new/hsm_secret>\n");
 	printf("	- dumponchaindescriptors [--show-secrets] <path/to/hsm_secret> [network]\n");
 	printf("	- makerune <path/to/hsm_secret>\n");
@@ -485,21 +494,27 @@ static void derive_to_remote(const struct unilateral_close_info *info, const cha
  * closed on a splice inflight and onchaind did not recognise the
  * commitment as ours).  Everything comes from hsm_secret plus the peer
  * id and channel dbid, except the peer's revocation basepoint, which
- * the channel_reestablish/DB holds. */
-static void derive_delayed(const struct node_id *node_id, u64 channel_id,
-			   u64 commit_num, u16 to_self_delay,
-			   const struct pubkey *peer_revocation_basepoint,
-			   const char *hsm_secret_path)
+ * the channel's DB row holds (revocation_basepoint_remote). */
+struct delayed_keys {
+	struct pubkey funding_pubkey;
+	struct pubkey per_commitment_point;
+	struct pubkey delayed_key;
+	struct privkey privkey;
+	struct pubkey revocation_key;
+	u8 *wscript;
+	u8 *scriptpubkey;
+};
+
+static void derive_delayed_keys(const tal_t *ctx,
+				const struct node_id *node_id, u64 channel_id,
+				u64 commit_num, u16 to_self_delay,
+				const struct pubkey *peer_revocation_basepoint,
+				const char *hsm_secret_path,
+				struct delayed_keys *k)
 {
 	struct secret hsm_secret, channel_seed, basepoint_secret;
-	struct pubkey funding_pubkey, basepoint, per_commitment_point;
-	struct pubkey delayed_key, revocation_key;
-	struct privkey privkey;
+	struct pubkey basepoint;
 	struct sha256 shaseed;
-	u8 *wscript, *scriptpubkey;
-
-	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
-						 | SECP256K1_CONTEXT_SIGN);
 
 	struct hsm_secret *hsms = load_hsm_secret(tmpctx, hsm_secret_path);
 	memcpy(hsm_secret.data, hsms->secret_data, sizeof(hsm_secret.data));
@@ -507,39 +522,112 @@ static void derive_delayed(const struct node_id *node_id, u64 channel_id,
 
 	/* The funding key is the check: it must be one of the two keys in
 	 * the commitment's witness script, or the seed is wrong. */
-	if (!derive_funding_key(&channel_seed, &funding_pubkey, NULL))
+	if (!derive_funding_key(&channel_seed, &k->funding_pubkey, NULL))
 		errx(ERROR_KEYDERIV, "Could not derive funding key for dbid %"PRIu64,
 		     channel_id);
 	if (!derive_shaseed(&channel_seed, &shaseed))
 		errx(ERROR_KEYDERIV, "Could not derive shaseed for dbid %"PRIu64,
 		     channel_id);
-	if (!per_commit_point(&shaseed, &per_commitment_point, commit_num))
+	if (!per_commit_point(&shaseed, &k->per_commitment_point, commit_num))
 		errx(ERROR_KEYDERIV, "Could not derive per-commitment point #%"PRIu64,
 		     commit_num);
 	if (!derive_delayed_payment_basepoint(&channel_seed, &basepoint,
 					      &basepoint_secret))
 		errx(ERROR_KEYDERIV, "Could not derive delayed payment basepoint"
 		     " for dbid %"PRIu64, channel_id);
-	if (!derive_simple_key(&basepoint, &per_commitment_point, &delayed_key))
+	if (!derive_simple_key(&basepoint, &k->per_commitment_point,
+			       &k->delayed_key))
 		errx(ERROR_KEYDERIV, "Could not derive delayed payment key");
 	if (!derive_simple_privkey(&basepoint_secret, &basepoint,
-				   &per_commitment_point, &privkey))
+				   &k->per_commitment_point, &k->privkey))
 		errx(ERROR_KEYDERIV, "Could not derive delayed payment privkey");
 	if (!derive_revocation_key(peer_revocation_basepoint,
-				   &per_commitment_point, &revocation_key))
+				   &k->per_commitment_point, &k->revocation_key))
 		errx(ERROR_KEYDERIV, "Could not derive revocation key");
 
-	wscript = bitcoin_wscript_to_local(tmpctx, to_self_delay, 0,
-					   &revocation_key, &delayed_key);
-	scriptpubkey = scriptpubkey_p2wsh(tmpctx, wscript);
+	k->wscript = bitcoin_wscript_to_local(ctx, to_self_delay, 0,
+					      &k->revocation_key,
+					      &k->delayed_key);
+	k->scriptpubkey = scriptpubkey_p2wsh(ctx, k->wscript);
+}
 
-	printf("funding pubkey       : %s\n", fmt_pubkey(tmpctx, &funding_pubkey));
-	printf("per-commitment point : %s\n", fmt_pubkey(tmpctx, &per_commitment_point));
-	printf("delayed pubkey       : %s\n", fmt_pubkey(tmpctx, &delayed_key));
-	printf("delayed privkey      : %s\n", fmt_secret(tmpctx, &privkey.secret));
-	printf("revocation pubkey    : %s\n", fmt_pubkey(tmpctx, &revocation_key));
-	printf("witness script       : %s\n", tal_hex(tmpctx, wscript));
-	printf("scriptpubkey (p2wsh) : %s\n", tal_hex(tmpctx, scriptpubkey));
+static void print_delayed_keys(const struct delayed_keys *k)
+{
+	printf("funding pubkey       : %s\n", fmt_pubkey(tmpctx, &k->funding_pubkey));
+	printf("per-commitment point : %s\n", fmt_pubkey(tmpctx, &k->per_commitment_point));
+	printf("delayed pubkey       : %s\n", fmt_pubkey(tmpctx, &k->delayed_key));
+	printf("delayed privkey      : %s\n", fmt_secret(tmpctx, &k->privkey.secret));
+	printf("revocation pubkey    : %s\n", fmt_pubkey(tmpctx, &k->revocation_key));
+	printf("witness script       : %s\n", tal_hex(tmpctx, k->wscript));
+	printf("scriptpubkey (p2wsh) : %s\n", tal_hex(tmpctx, k->scriptpubkey));
+}
+
+static void derive_delayed(const struct node_id *node_id, u64 channel_id,
+			   u64 commit_num, u16 to_self_delay,
+			   const struct pubkey *peer_revocation_basepoint,
+			   const char *hsm_secret_path)
+{
+	struct delayed_keys k;
+
+	derive_delayed_keys(tmpctx, node_id, channel_id, commit_num,
+			    to_self_delay, peer_revocation_basepoint,
+			    hsm_secret_path, &k);
+	print_delayed_keys(&k);
+}
+
+/* Build and sign the sweep of that output: one input with the CSV
+ * sequence, one output to the destination, witness <sig> <> <script>
+ * as onchaind would make it.  Check the printed scriptpubkey against the
+ * output before broadcasting. */
+static void sweep_delayed(const struct node_id *node_id, u64 channel_id,
+			  u64 commit_num, u16 to_self_delay,
+			  const struct pubkey *peer_revocation_basepoint,
+			  const struct bitcoin_outpoint *outpoint,
+			  struct amount_sat amount,
+			  const char *dest_addr, struct amount_sat fee,
+			  const char *hsm_secret_path, const char *network)
+{
+	struct delayed_keys k;
+	struct bitcoin_tx *tx;
+	struct bitcoin_signature sig;
+	struct bitcoin_txid txid;
+	struct amount_sat out;
+	u8 *dest_script;
+
+	/* The global: bitcoin/psbt.c and friends read it. */
+	chainparams = chainparams_for_network(network);
+	if (!chainparams)
+		errx(ERROR_USAGE, "Unknown network %s", network);
+	derive_delayed_keys(tmpctx, node_id, channel_id, commit_num,
+			    to_self_delay, peer_revocation_basepoint,
+			    hsm_secret_path, &k);
+	print_delayed_keys(&k);
+
+	if (!decode_scriptpubkey_from_addr(tmpctx, chainparams, dest_addr,
+					   &dest_script))
+		errx(ERROR_USAGE, "Bad destination address %s for %s",
+		     dest_addr, network);
+	if (!amount_sat_sub(&out, amount, fee))
+		errx(ERROR_USAGE, "Fee %s exceeds amount %s",
+		     fmt_amount_sat(tmpctx, fee), fmt_amount_sat(tmpctx, amount));
+	if (amount_sat_less(out, chainparams->dust_limit))
+		errx(ERROR_USAGE, "Output %s would be below the dust limit",
+		     fmt_amount_sat(tmpctx, out));
+
+	tx = bitcoin_tx(tmpctx, chainparams, 1, 1, 0);
+	bitcoin_tx_add_input(tx, outpoint, to_self_delay, NULL, amount,
+			     k.scriptpubkey, k.wscript);
+	bitcoin_tx_add_output(tx, dest_script, NULL, out);
+	sign_tx_input(tx, 0, NULL, k.wscript, &k.privkey, &k.delayed_key,
+		      SIGHASH_ALL, &sig);
+	bitcoin_tx_input_set_witness(tx, 0,
+				     bitcoin_witness_sig_and_element(tx, &sig,
+								     NULL, 0,
+								     k.wscript));
+	bitcoin_txid(tx, &txid);
+	printf("sweep weight         : %zu\n", bitcoin_tx_weight(tx));
+	printf("sweep txid           : %s\n", fmt_bitcoin_txid(tmpctx, &txid));
+	printf("sweep tx             : %s\n", tal_hex(tmpctx, linearize_tx(tmpctx, tx)));
 }
 
 static void dumponchaindescriptors(const char *hsm_secret_path,
@@ -733,10 +821,8 @@ int main(int argc, char *argv[])
 {
 	const char *method;
 
-	setup_locale();
-	err_set_progname(argv[0]);
-	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
-	                                         | SECP256K1_CONTEXT_SIGN);
+	/* Wally must allocate through tal before any transaction is built. */
+	common_setup(argv[0]);
 
 	method = argc > 1 ? argv[1] : NULL;
 	if (!method)
@@ -801,6 +887,28 @@ int main(int argc, char *argv[])
 		derive_delayed(&node_id, atol(argv[3]), atol(argv[4]),
 			       atol(argv[5]), &peer_revocation_basepoint,
 			       argv[7]);
+
+	} else if (streq(method, "sweepdelayed")) {
+		/*  node_id  dbid  commit_num  to_self_delay  peer_revocation_basepoint
+		 *  txid  vout  amount_sat  dest_addr  fee_sat  hsm_secret  [network] */
+		if (argc < 13 || argc > 14)
+			show_usage(argv[0]);
+		struct node_id node_id;
+		struct pubkey peer_revocation_basepoint;
+		struct bitcoin_outpoint outpoint;
+		if (!node_id_from_hexstr(argv[2], strlen(argv[2]), &node_id))
+			errx(ERROR_USAGE, "Bad node id");
+		if (!pubkey_from_hexstr(argv[6], strlen(argv[6]),
+					&peer_revocation_basepoint))
+			errx(ERROR_USAGE, "Bad peer revocation basepoint");
+		if (!bitcoin_txid_from_hex(argv[7], strlen(argv[7]), &outpoint.txid))
+			errx(ERROR_USAGE, "Bad txid");
+		outpoint.n = atol(argv[8]);
+		sweep_delayed(&node_id, atol(argv[3]), atol(argv[4]),
+			      atol(argv[5]), &peer_revocation_basepoint,
+			      &outpoint, amount_sat(atol(argv[9])), argv[10],
+			      amount_sat(atol(argv[11])), argv[12],
+			      argc == 14 ? argv[13] : "bitcoin");
 
 	} else if (streq(method, "generatehsm")) {
 		if (argc != 3)
